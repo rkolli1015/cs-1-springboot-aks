@@ -3,47 +3,96 @@ trigger:
     include:
       - main
 
-pool:
-  name: LocalAgentPool  # ✅ Your self-hosted agent pool
-
 jobs:
-- job: BuildAndPush
-  displayName: 'Build and Push Docker Image'
-  steps:
-    - checkout: self
-      clean: true
-      fetchTags: false
+  - job: BuildAndPush
+    displayName: 'Build and Push Docker Image'
+    pool:
+      name: LocalAgentPool
 
-    - task: Maven@4
-      displayName: 'Maven Build'
-      inputs:
-        mavenPomFile: 'pom.xml'
-        goals: 'package'
-        options: '-DskipTests'
+    steps:
+      - checkout: self
+        clean: true
+        fetchTags: false
 
-    - task: Docker@2
-      displayName: 'Build Docker Image'
-      inputs:
-        containerRegistry: 'acr-connection'       # ✅ Docker Registry service connection
-        repository: 'springboot-app'              # ✅ Image name only
-        command: build
-        Dockerfile: 'Dockerfile'
-        buildContext: '.'
-        tags: |
-          $(Build.BuildId)
-          latest
+      - task: Maven@4
+        displayName: 'Maven Build'
+        inputs:
+          mavenPomFile: 'pom.xml'
+          goals: 'package'
+          options: '-DskipTests'
 
-    - task: Docker@2
-      displayName: 'Push Docker Image'
-      inputs:
-        containerRegistry: 'acr-connection'
-        repository: 'springboot-app'
-        command: push
-        tags: |
-          $(Build.BuildId)
-          latest
+      - task: Docker@2
+        displayName: 'Build Docker Image'
+        inputs:
+          containerRegistry: 'acr-connection'
+          repository: 'springboot-app'
+          command: build
+          Dockerfile: 'Dockerfile'
+          buildContext: '.'
+          tags: |
+            $(Build.BuildId)
+            latest
 
-    - task: CopyFiles@2
-      displayName: 'Copy Deployment YAML'
-      inputs:
-        Contents: 'updated-acr.yaml
+      - task: Docker@2
+        displayName: 'Push Docker Image'
+        inputs:
+          containerRegistry: 'acr-connection'
+          repository: 'springboot-app'
+          command: push
+          tags: |
+            $(Build.BuildId)
+            latest
+
+      - task: CopyFiles@2
+        displayName: 'Copy Deployment YAML'
+        inputs:
+          Contents: 'updated-acr.yaml'
+          TargetFolder: '$(Build.ArtifactStagingDirectory)'
+
+      - task: PublishBuildArtifacts@1
+        displayName: 'Publish Artifact'
+        inputs:
+          PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+          ArtifactName: 'drop'
+
+  - job: DeployToAKS
+    displayName: 'Deploy to AKS'
+    dependsOn: BuildAndPush
+    pool:
+      name: LocalAgentPool
+
+    steps:
+      - task: DownloadBuildArtifacts@0
+        displayName: 'Download Artifact'
+        inputs:
+          buildType: 'current'
+          downloadType: 'single'
+          artifactName: 'drop'
+          downloadPath: '$(Pipeline.Workspace)/drop'
+
+      - script: |
+          echo "Listing contents of artifact directory:"
+          ls -l $(Pipeline.Workspace)/drop
+        displayName: 'Debug Artifact Path'
+
+      - task: AzureCLI@2
+        displayName: 'Deploy to AKS using kubectl'
+        inputs:
+          azureSubscription: 'azure-rm-connection'
+          scriptType: 'bash'
+          scriptLocation: 'inlineScript'
+          inlineScript: |
+            az aks get-credentials \
+              --resource-group rg-aks-dev \
+              --name aks-dev-cluster \
+              --overwrite-existing
+
+            echo "Applying deployment manifest..."
+            kubectl apply -f $(Pipeline.Workspace)/drop/updated-acr.yaml
+
+            echo "Checking rollout status..."
+            if kubectl get deployment springboot-app >/dev/null 2>&1; then
+              kubectl rollout status deployment/springboot-app
+            else
+              echo "Deployment 'springboot-app' not found. Skipping rollout status check."
+            fi
